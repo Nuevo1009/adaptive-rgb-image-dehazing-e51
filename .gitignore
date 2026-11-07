@@ -1,44 +1,34 @@
-
-# Python environment
+# Python
 .venv/
 venv/
 env/
-
-# Python cache
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
 
-# IDE
-.vscode/
-.idea/
-
-# Operating system
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Temporary files and logs
-*.log
-*.tmp
-*.bak
-
-# Dataset - do not upload the full dataset
+# Local datasets and generated outputs
 dataset/
 datasets/
-
-# Generated outputs - keep only selected results
 outputs/
 temp/
 cache/
 
-# Large model checkpoints - manage separately
+# Model checkpoints and large binary weights
 *.pt
 *.pth
 *.ckpt
 *.onnx
 
-# Jupyter temporary files
-.ipynb_checkpoints/
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# Secrets
+# Logs and local secrets
+*.log
+*.tmp
+*.bak
 .env

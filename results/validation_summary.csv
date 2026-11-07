@@ -1,0 +1,7 @@
+metric,E3-E,E5.1,difference_E5.1_minus_E3-E,preferred_direction,validation_pairs,status
+PSNR_dB,19.709367,19.743819,0.034452,higher,1200,reported aggregate; raw CSV not in supplied ZIP
+SSIM,0.821066,0.823807,0.002741,higher,1200,reported aggregate; raw CSV not in supplied ZIP
+FSIM,0.926025,0.926175,0.00015,higher,1200,reported aggregate; raw CSV not in supplied ZIP
+CIE76_DeltaE,11.798564,11.6766,-0.121964,lower,1200,reported aggregate; raw CSV not in supplied ZIP
+EPI,0.907286,0.907465,0.000179,higher,1200,reported aggregate; raw CSV not in supplied ZIP
+Edge_Retention,0.875162,0.874515,-0.000647,interpret with care,1200,reported aggregate; raw CSV not in supplied ZIP
