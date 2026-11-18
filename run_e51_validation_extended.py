@@ -13,11 +13,67 @@ import numpy as np
 from dataset_config import PROJECT_ROOT, match_pairs
 from dehazing.core import DehazeConfig, dehaze_image, read_rgb, validate_rgb
 
-SPLIT = "validation"  # Deliberately fixed: never change to test for tuning.
-HAZY_DIR = PROJECT_ROOT / "dataset" / "CNN_Dataset" / SPLIT / "hazy"
-CLEAR_DIR = PROJECT_ROOT / "dataset" / "CNN_Dataset" / SPLIT / "clear"
+#SPLIT = ""  # Deliberately fixed: never change to test for tuning.
+HAZY_DIR = PROJECT_ROOT / "dataset" / "CNN_Dataset" / "test" / "hazy"
+CLEAR_DIR = PROJECT_ROOT / "dataset" / "CNN_Dataset" / "test" / "clear"
 OUT = PROJECT_ROOT / "outputs" / "E5_1_confidence_guided_validation"
 CHECKPOINT_EVERY = 20
+
+
+# Extended perceptual metrics (MS-SSIM, BRISQUE, NIQE, PIQE).
+_EXTENDED_METRIC_OBJECTS = None
+_EXTENDED_METRIC_DEVICE = None
+
+
+def initialize_extended_metrics(device=None):
+    """Initialize pyiqa metrics once. Inputs are RGB tensors in [0, 1]."""
+    global _EXTENDED_METRIC_OBJECTS, _EXTENDED_METRIC_DEVICE
+    if _EXTENDED_METRIC_OBJECTS is not None:
+        return
+    try:
+        import torch
+        import pyiqa
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install the additional metric dependency in the project venv: "
+            "python -m pip install pyiqa"
+        ) from exc
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    _EXTENDED_METRIC_DEVICE = torch.device(device)
+    names = ("ms_ssim", "brisque", "niqe", "piqe")
+    _EXTENDED_METRIC_OBJECTS = {
+        name: pyiqa.create_metric(name, device=_EXTENDED_METRIC_DEVICE, as_loss=False)
+        for name in names
+    }
+
+
+def extended_metrics(gt, pred):
+    """Return MS-SSIM, BRISQUE, NIQE and PIQE for a uint8 RGB prediction."""
+    import torch
+    if _EXTENDED_METRIC_OBJECTS is None:
+        initialize_extended_metrics()
+
+    def to_tensor(image):
+        return torch.from_numpy(
+            np.ascontiguousarray(image.astype(np.float32) / 255.0)
+        ).permute(2, 0, 1).unsqueeze(0).to(_EXTENDED_METRIC_DEVICE)
+
+    gt_t, pred_t = to_tensor(gt), to_tensor(pred)
+    values = []
+    with torch.no_grad():
+        for name in ("ms_ssim", "brisque", "niqe", "piqe"):
+            try:
+                score = (_EXTENDED_METRIC_OBJECTS[name](pred_t, gt_t)
+                         if name == "ms_ssim"
+                         else _EXTENDED_METRIC_OBJECTS[name](pred_t))
+                values.append(float(score.detach().reshape(-1)[0].cpu().item()))
+            except Exception as exc:
+                print(f"WARNING: {name} failed: {exc}")
+                values.append(float("nan"))
+    return tuple(values)
+
 
 # E3-E is frozen as the reference configuration currently selected in core.py.
 E3E_CONFIG = DehazeConfig.e3e_selected(
@@ -145,7 +201,12 @@ def main():
     header = ["image", "PSNR_E3E", "PSNR_E5_1", "delta_PSNR", "SSIM_E3E", "SSIM_E5_1", "delta_SSIM",
               "FSIM_E3E", "FSIM_E5_1", "delta_FSIM", "CIE76_DeltaE_E3E", "CIE76_DeltaE_E5_1", "delta_DeltaE",
               "EPI_E3E", "EPI_E5_1", "delta_EPI", "Edge_E3E", "Edge_E5_1", "delta_Edge",
+              "MS_SSIM_E3E", "MS_SSIM_E5_1", "delta_MS_SSIM",
+              "BRISQUE_E3E", "BRISQUE_E5_1", "delta_BRISQUE",
+              "NIQE_E3E", "NIQE_E5_1", "delta_NIQE",
+              "PIQE_E3E", "PIQE_E5_1", "delta_PIQE",
               "alpha_mean", "alpha_min", "alpha_max"]
+    initialize_extended_metrics()
     rows = []
     skipped = []
     print(f"Matched validation pairs: {len(pairs)}")
@@ -163,12 +224,22 @@ def main():
             e3e = dehaze_image(hazy, E3E_CONFIG)["dehazed"]
             e51, alpha_map = apply_adaptive_chroma(hazy, e3e)
             e3e8, e518 = as_u8(e3e), as_u8(e51)
-            m0 = metrics(gt, e3e8)
-            m1 = metrics(gt, e518)
-            rows.append([hazy_path.name, m0[0], m1[0], m1[0]-m0[0], m0[1], m1[1], m1[1]-m0[1],
-                         m0[2], m1[2], m1[2]-m0[2], m0[3], m1[3], m1[3]-m0[3],
-                         m0[4], m1[4], m1[4]-m0[4], m0[5], m1[5], m1[5]-m0[5],
-                         float(np.mean(alpha_map)), float(np.min(alpha_map)), float(np.max(alpha_map))])
+            m0, m1 = metrics(gt, e3e8), metrics(gt, e518)
+            x0, x1 = extended_metrics(gt, e3e8), extended_metrics(gt, e518)
+            rows.append([
+                hazy_path.name,
+                m0[0], m1[0], m1[0]-m0[0],
+                m0[1], m1[1], m1[1]-m0[1],
+                m0[2], m1[2], m1[2]-m0[2],
+                m0[3], m1[3], m1[3]-m0[3],
+                m0[4], m1[4], m1[4]-m0[4],
+                m0[5], m1[5], m1[5]-m0[5],
+                x0[0], x1[0], x1[0]-x0[0],
+                x0[1], x1[1], x1[1]-x0[1],
+                x0[2], x1[2], x1[2]-x0[2],
+                x0[3], x1[3], x1[3]-x0[3],
+                float(np.mean(alpha_map)), float(np.min(alpha_map)), float(np.max(alpha_map))
+            ])
             # Save both outputs so they can be inspected and reused.
             cv2.imwrite(str(e3e_dir / f"{hazy_path.stem}_dehazed.png"), cv2.cvtColor(e3e8, cv2.COLOR_RGB2BGR))
             cv2.imwrite(str(e51_dir / f"{hazy_path.stem}_dehazed.png"), cv2.cvtColor(e518, cv2.COLOR_RGB2BGR))
@@ -179,8 +250,10 @@ def main():
             write_csv(OUT / "skipped.csv", ["image", "reason"], skipped)
             print(f"Progress: {i}/{len(pairs)} | successful: {len(rows)} | skipped: {len(skipped)}", flush=True)
 
-    metric_names = ["PSNR", "SSIM", "FSIM", "CIE76_DeltaE", "EPI", "Edge_Retention"]
-    idx = [(1,2), (4,5), (7,8), (10,11), (13,14), (16,17)]
+    metric_names = ["PSNR", "SSIM", "FSIM", "CIE76_DeltaE", "EPI", "Edge_Retention",
+                    "MS_SSIM", "BRISQUE", "NIQE", "PIQE"]
+    idx = [(1,2), (4,5), (7,8), (10,11), (13,14), (16,17),
+           (19,20), (22,23), (25,26), (28,29)]
     summary = []
     for name, (a, b) in zip(metric_names, idx):
         va = np.array([float(r[a]) for r in rows], dtype=float)
