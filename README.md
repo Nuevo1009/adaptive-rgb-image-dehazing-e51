@@ -282,13 +282,15 @@ The framework evaluates image quality using ten metrics.
 | PSNR | Peak Signal-to-Noise Ratio | Higher |
 | SSIM | Structural Similarity Index | Higher |
 | FSIM | Feature Similarity Index | Higher |
-| CIE76 DeltaE | Colour difference | Lower |
+| S-CIELAB | Spatial colour-difference measure | Lower |
 | EPI | Edge Preservation Index | Higher |
 | Edge Retention | Edge preservation measurement | Higher |
 | MS-SSIM | Multi-Scale Structural Similarity | Higher |
 | BRISQUE | Blind image-quality assessment | Lower |
 | NIQE | Natural Image Quality Evaluator | Lower |
 | PIQE | Perception-Based Image Quality Evaluator | Lower |
+
+S-CIELAB evaluates spatial colour differences while accounting for spatial properties of human colour vision. Its result is interpreted as a colour-difference value, so lower values indicate better colour fidelity. The viewing-condition parameters (including samples per degree) should be documented and calibrated for reproducible evaluation.
 
 The first seven metrics provide full-reference or reference-based image-quality information. BRISQUE, NIQE, and PIQE provide no-reference image-quality assessments.
 
