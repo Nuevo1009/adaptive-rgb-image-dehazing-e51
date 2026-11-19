@@ -7,8 +7,11 @@ dehazing/, and run_e51_validation_extended.py).
 Workflow:
   A. Classify dataset images and save classifications to CSV, OR
      reuse an existing classification CSV, OR skip classification.
-  B. Compare Original paper baseline, E3-E, and E5.1.
-  C. Save dehazed images, per-image metrics, summary CSVs, and graphs.
+  B. Compare Original paper baseline, E3-E, and E5.1 on every matched pair.
+  C. When CNN classifications are supplied, also evaluate the CNN-routed output:
+       CLEAR -> original hazy input (bypass)
+       HAZY/UNCERTAIN -> E5.1 output
+  D. Save images, per-image metrics, summary CSVs, and graphs.
 
 E5.1 is the E3-E preset followed by adaptive RGB chroma preservation.
 The original paper baseline is DehazeConfig() with optional extensions off.
@@ -39,7 +42,7 @@ CLASSIFICATION_ROOT = OUTPUT_ROOT / "classification"
 IMAGE_EXTENSIONS = IMAGE_EXTS
 
 METRIC_NAMES = [
-    "PSNR", "SSIM", "FSIM", "CIE76_DeltaE", "EPI", "Edge_Retention",
+    "PSNR", "SSIM", "FSIM", "S_CIELAB", "EPI", "Edge_Retention",
     "MS_SSIM", "BRISQUE", "NIQE", "PIQE"
 ]
 # Higher is better for these; lower is better for all remaining metrics.
@@ -179,7 +182,8 @@ def classify_and_save(hazy_dir, dataset_name, run_dir):
 def save_rgb_u8(image, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    image = e51.as_u8(image)
+    # Accept either normalized float RGB [0, 1] or already-quantized uint8 RGB.
+    image = image if image.dtype == np.uint8 else e51.as_u8(image)
     if not cv2.imwrite(str(path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR)):
         raise OSError(f"Could not save output image: {path}")
 
@@ -192,88 +196,51 @@ def metric_vector(gt, prediction):
 
 
 def plot_comparisons(summary_rows, dataset_name, output_dir):
-    """Create individual report graphs with moderately zoomed y-axes."""
+    """Plot the three algorithmic methods: APTE, E3-E and E5.1."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     graph_dir = output_dir / "graphs"
     graph_dir.mkdir(parents=True, exist_ok=True)
-
-    methods = [
-        "Adaptive Pixel-Wise Transmission Estimation (APTE)",
+    labels = [
+        "APTE",
         "Proposed Method - 1",
         "Proposed Method - 2",
     ]
-    x = np.arange(len(methods), dtype=float)
+    x = np.arange(3, dtype=float)
 
     for metric in METRIC_NAMES:
         selected = next((r for r in summary_rows if r[0] == metric), None)
         if selected is None:
             continue
-
         values = np.asarray([selected[1], selected[2], selected[3]], dtype=float)
         valid = np.isfinite(values)
         if valid.sum() < 2:
-            print(f"Skipping {metric}: fewer than two finite method values.")
             continue
-
-        finite_values = values[valid]
-        vmin = float(np.min(finite_values))
-        vmax = float(np.max(finite_values))
+        xv, yv = x[valid], values[valid]
+        vmin, vmax = float(yv.min()), float(yv.max())
         spread = vmax - vmin
-
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(
-            x[valid], finite_values,
-            marker="o", markersize=8, linewidth=2.2
-        )
-
-        # Numeric labels make the exact values readable in print.
-        y_span = spread if spread > 1e-12 else max(abs(vmax) * 0.02, 0.01)
-        annotation_gap = y_span * 0.035
-        for xpos, value in zip(x[valid], finite_values):
-            ax.annotate(
-                f"{value:.4f}",
-                (xpos, value),
-                xytext=(0, 8),
-                textcoords="offset points",
-                ha="center",
-                va="bottom",
-                fontsize=9
-            )
-
+        fig, ax = plt.subplots(figsize=(14, 7))
+        ax.plot(xv, yv, marker="o", markersize=9, linewidth=2.5)
+        for xpos, value in zip(xv, yv):
+            ax.annotate(f"{value:.4f}", (xpos, value), xytext=(0, 12),
+                        textcoords="offset points", ha="center",
+                        va="bottom", fontsize=11)
         ax.set_xticks(x)
-        ax.set_xticklabels(methods, rotation=0, ha="center", fontsize=9)
-        # Keep the categorical x-axis close to its data range, with small margins.
-        ax.set_xlim(-0.18, 2.18)
-
-        # Balanced scale: show the deviation without either compressing it
-        # against zero or tightly cropping to the min/max values.
-        # The same 35% range-padding rule is applied to every metric.
-        if spread > 1e-12:
-            y_padding = spread * 0.35
-        else:
-            y_padding = max(abs(vmax) * 0.05, 0.01)
-        lower = max(0.0, vmin - y_padding)
-        upper = vmax + y_padding
-        if upper <= lower:
-            upper = lower + max(abs(vmax) * 0.1, 0.1)
-        ax.set_ylim(lower, upper)
-
-        ax.set_xlabel("Dehazing method")
-        ax.set_ylabel(metric.replace("_", " "))
-        # No title: dataset and metric should be stated in the report caption.
+        ax.set_xticklabels(labels, rotation=0, ha="center", fontsize=10)
+        ax.set_xlim(-0.12, 2.12)
+        padding = spread * 0.35 if spread > 1e-12 else max(abs(vmax) * 0.05, 0.01)
+        ax.set_ylim(max(0.0, vmin - padding), vmax + padding)
+        ax.set_xlabel("Dehazing method", fontsize=12, labelpad=10)
+        ax.set_ylabel(metric.replace("_", " "), fontsize=12)
         ax.grid(True, axis="both", linestyle="--", alpha=0.4)
-        ax.tick_params(axis="y", labelsize=9)
-        ax.tick_params(axis="x", pad=12)
+        ax.tick_params(axis="y", labelsize=10)
+        ax.tick_params(axis="x", pad=14)
         fig.tight_layout()
-
-        filename = f"{metric}_line.png"
-        fig.savefig(graph_dir / filename, dpi=400, bbox_inches="tight")
+        fig.savefig(graph_dir / f"{metric}_line.png", dpi=400, bbox_inches="tight")
         plt.close(fig)
-
-    print(f"Individual line graphs saved in: {graph_dir}")
+    print(f"Three-method comparison graphs saved in: {graph_dir}")
 
 def evaluate_pairs(dataset_name, hazy_dir, clear_dir, run_dir, classification_map=None):
     pairs, unmatched_hazy, unmatched_clear = match_pairs(hazy_dir, clear_dir)
@@ -285,25 +252,33 @@ def evaluate_pairs(dataset_name, hazy_dir, clear_dir, run_dir, classification_ma
     e3e_dir = out / "02_E3E_REFERENCE"
     e51_dir = out / "03_E5_1"
     routed_dir = out / "04_CNN_ROUTED_OUTPUT"
+
     for folder in (original_dir, e3e_dir, e51_dir):
         folder.mkdir(parents=True, exist_ok=True)
     if classification_map is not None:
         routed_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\nInitializing PSNR, SSIM, FSIM, CIE76_DeltaE, EPI, Edge Retention, MS-SSIM, BRISQUE, NIQE and PIQE...")
+    print("\\nInitializing PSNR, SSIM, FSIM, S-CIELAB, EPI, Edge Retention, MS-SSIM, BRISQUE, NIQE and PIQE...")
     e51.initialize_extended_metrics()
 
     header = ["image"]
     for metric in METRIC_NAMES:
-        header += [f"{metric}_Original", f"{metric}_E3E", f"{metric}_E5_1"]
+        header += [
+            f"{metric}_Original",
+            f"{metric}_E3E",
+            f"{metric}_E5_1",
+            f"{metric}_CNN_Routed",
+        ]
     header += ["predicted_class", "haze_score", "routed_action"]
     rows, skipped = [], []
 
-    # Frozen configurations: original baseline vs selected E3-E and E5.1.
     original_config = DehazeConfig()
     e3e_config = e51.E3E_CONFIG
 
     print(f"Matched pairs: {len(pairs)}")
+    if classification_map is None:
+        print("CNN-routed metrics will be blank because classification was skipped.")
+
     for index, (hazy_path, gt_path) in enumerate(pairs, 1):
         try:
             hazy = read_rgb(hazy_path)
@@ -312,6 +287,7 @@ def evaluate_pairs(dataset_name, hazy_dir, clear_dir, run_dir, classification_ma
                 skipped.append([hazy_path.name, "hazy/GT dimension mismatch"])
                 continue
 
+            # Algorithm-level evaluation: all matched image pairs, regardless of CNN label.
             original = dehaze_image(hazy, original_config)["dehazed"]
             e3e = dehaze_image(hazy, e3e_config)["dehazed"]
             e51_image, alpha = e51.apply_adaptive_chroma(hazy, e3e)
@@ -323,35 +299,46 @@ def evaluate_pairs(dataset_name, hazy_dir, clear_dir, run_dir, classification_ma
             vectors = [
                 metric_vector(gt, original_u8),
                 metric_vector(gt, e3e_u8),
-                metric_vector(gt, e51_u8)
+                metric_vector(gt, e51_u8),
             ]
 
+            # System-level evaluation: evaluate the actual CNN-routed output.
             predicted_class, haze_score, action = "", "", ""
+            routed_vector = [""] * len(METRIC_NAMES)
+
             if classification_map is not None:
                 record = classification_map.get(hazy_path.name)
+
                 if record is None:
                     predicted_class = "MISSING_CLASSIFICATION"
-                    routed_u8 = hazy
-                    action = "NO_CLASSIFICATION_RECORD"
+                    routed_u8 = e51.as_u8(hazy)
+                    action = "BYPASSED_MISSING_CLASSIFICATION"
                 else:
-                    predicted_class = record.get("classification", "")
+                    predicted_class = record.get("classification", "").strip().upper()
                     haze_score = record.get("haze_score", "")
+
                     if predicted_class == "CLEAR":
-                        routed_u8 = hazy
+                        routed_u8 = e51.as_u8(hazy)
                         action = "BYPASSED_CLEAR"
                     elif predicted_class in {"HAZY", "UNCERTAIN"}:
                         routed_u8 = e51_u8
                         action = "DEHAZED_E5_1"
                     else:
-                        routed_u8 = hazy
+                        # ERROR/unknown labels are conservatively passed through unchanged.
+                        routed_u8 = e51.as_u8(hazy)
                         action = "BYPASSED_INVALID_OR_ERROR"
+
+                routed_vector = metric_vector(gt, routed_u8)
                 save_rgb_u8(routed_u8, routed_dir / f"{hazy_path.stem}_routed.png")
 
             row = [hazy_path.name]
             for metric_index in range(len(METRIC_NAMES)):
-                row.extend([vectors[0][metric_index],
-                            vectors[1][metric_index],
-                            vectors[2][metric_index]])
+                row.extend([
+                    vectors[0][metric_index],
+                    vectors[1][metric_index],
+                    vectors[2][metric_index],
+                    routed_vector[metric_index],
+                ])
             row.extend([predicted_class, haze_score, action])
             rows.append(row)
 
@@ -362,7 +349,10 @@ def evaluate_pairs(dataset_name, hazy_dir, clear_dir, run_dir, classification_ma
             if index % 10 == 0 or index == len(pairs):
                 write_csv(out / "per_image_metrics.csv", header, rows)
                 write_csv(out / "skipped.csv", ["image", "reason"], skipped)
-                print(f"Progress {index}/{len(pairs)} | successful {len(rows)} | skipped {len(skipped)}")
+                print(
+                    f"Progress {index}/{len(pairs)} | "
+                    f"successful {len(rows)} | skipped {len(skipped)}"
+                )
 
         except Exception as exc:
             skipped.append([hazy_path.name, repr(exc)])
@@ -371,14 +361,28 @@ def evaluate_pairs(dataset_name, hazy_dir, clear_dir, run_dir, classification_ma
     if not rows:
         raise SystemExit("All image pairs failed. Check skipped.csv for details.")
 
+    # Summary and plots intentionally compare only the three dehazing algorithms.
+    # CNN-routed metrics remain available per image but are not added as a fourth
+    # method to summary_metrics.csv or the comparison graphs.
     summary = []
     for metric_index, metric in enumerate(METRIC_NAMES):
-        values = []
+        method_means = []
+        counts = []
         for method_index in range(3):
-            col = 1 + metric_index * 3 + method_index
-            arr = np.asarray([float(r[col]) for r in rows], dtype=float)
-            values.append(float(np.nanmean(arr)) if np.isfinite(arr).any() else float("nan"))
-        summary.append([metric, *values, len(rows)])
+            col = 1 + metric_index * 4 + method_index
+            numeric = []
+            for row in rows:
+                try:
+                    number = float(row[col])
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(number):
+                    numeric.append(number)
+            counts.append(len(numeric))
+            method_means.append(float(np.mean(numeric)) if numeric else float("nan"))
+        # One shared n column: use common valid count across the three methods.
+        common_n = min(counts) if counts else 0
+        summary.append([metric, *method_means, common_n])
 
     write_csv(
         out / "summary_metrics.csv",
@@ -388,32 +392,43 @@ def evaluate_pairs(dataset_name, hazy_dir, clear_dir, run_dir, classification_ma
     plot_comparisons(summary, dataset_name, out)
 
     if classification_map is not None:
-        # Summarize classifier routing counts and keep classification CSV separately.
         counts = {}
         for row in rows:
             label = row[-3] or "UNKNOWN"
             counts[label] = counts.get(label, 0) + 1
+
         write_csv(
             out / "classification_routing_counts.csv",
             ["predicted_class", "image_count"],
-            [[k, v] for k, v in sorted(counts.items())]
+            [[key, value] for key, value in sorted(counts.items())]
         )
 
-    write_csv(out / "unmatched_pairs.csv",
-              ["unmatched_hazy", "unmatched_ground_truth"],
-              [[str(unmatched_hazy[i]) if i < len(unmatched_hazy) else "",
-                str(unmatched_clear[i]) if i < len(unmatched_clear) else ""]
-               for i in range(max(len(unmatched_hazy), len(unmatched_clear)))])
-    print(f"\nEvaluation complete: {out}")
+    write_csv(
+        out / "unmatched_pairs.csv",
+        ["unmatched_hazy", "unmatched_ground_truth"],
+        [
+            [
+                str(unmatched_hazy[i]) if i < len(unmatched_hazy) else "",
+                str(unmatched_clear[i]) if i < len(unmatched_clear) else "",
+            ]
+            for i in range(max(len(unmatched_hazy), len(unmatched_clear)))
+        ]
+    )
+
+    print(f"\\nEvaluation complete: {out}")
     print(f"Per-image metrics: {out / 'per_image_metrics.csv'}")
     print(f"Summary metrics  : {out / 'summary_metrics.csv'}")
     print(f"Graphs           : {out / 'graphs'}")
+    if classification_map is not None:
+        print(f"CNN-routed images: {routed_dir}")
+        print("CNN_Routed metrics evaluate the actual bypass/E5.1 output against ground truth.")
+    else:
+        print("CNN_Routed metric columns are blank because CNN classification was skipped.")
     return out
-
 
 def main():
     print("=" * 68)
-    print("CNN CLASSIFICATION + ORIGINAL / E3-E / E5.1 RGB DEHAZING EVALUATION")
+    print("CNN CLASSIFICATION + APTE / E3-E / E5.1 / CNN-ROUTED EVALUATION")
     print("=" * 68)
     dataset_name, root, hazy_dir, clear_dir, split = get_dataset()
     print(f"\nDataset: {dataset_name}")

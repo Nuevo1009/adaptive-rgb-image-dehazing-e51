@@ -10,6 +10,7 @@ import math
 import cv2
 import numpy as np
 
+
 from dataset_config import PROJECT_ROOT, match_pairs
 from dehazing.core import DehazeConfig, dehaze_image, read_rgb, validate_rgb
 
@@ -147,16 +148,119 @@ def as_u8(x):
     return np.clip(validate_rgb(x) * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
+
+# ---- Zhang-Wandell S-CIELAB implementation (embedded; no extra module import) ----
+from scipy.ndimage import gaussian_filter
+from skimage.color import rgb2xyz, xyz2lab, deltaE_cie76
+
+# Zhang & Wandell / Poirson & Wandell XYZ(1931 2-degree) -> opponent matrix.
+XYZ_TO_OPPONENT = np.array([
+    [278.7336, 721.8031, -106.5520],
+    [-448.7736, 289.8056, 77.1569],
+    [85.9513, -589.9859, 501.1089],
+], dtype=np.float64) / 1000.0
+OPPONENT_TO_XYZ = np.linalg.inv(XYZ_TO_OPPONENT)
+
+# Published normalized Gaussian-mixture coefficients from separableFilters.m.
+# Each row contains (visual-angle halfwidth in degrees, mixture weight).
+FILTERS = (
+    ((0.0500, 1.003270), (0.2250, 0.114416), (7.0000, -0.117686)),  # luminance
+    ((0.0685, 0.616725), (0.8260, 0.383275)),                        # red-green
+    ((0.0920, 0.567885), (0.6451, 0.432115)),                        # blue-yellow
+)
+
+DEFAULT_SAMPLES_PER_DEGREE = 60.0
+
+
+def _as_srgb01(image):
+    arr = np.asarray(image)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError("Input images must have shape HxWx3 in RGB order.")
+    arr = arr.astype(np.float64, copy=False)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("Input image contains NaN or infinite values.")
+    if arr.max(initial=0.0) > 1.0:
+        arr = arr / 255.0
+    return np.clip(arr, 0.0, 1.0)
+
+
+def _filter_opponent_channel(channel, mixture, samples_per_degree):
+    """Apply original S-CIELAB weighted Gaussian-mixture spatial filter."""
+    result = np.zeros(channel.shape, dtype=np.float64)
+    for halfwidth_deg, weight in mixture:
+        sigma_px = halfwidth_deg * samples_per_degree
+        # Published Gaussian form is exp(-r^2 / sigma^2), i.e. scipy's
+        # Gaussian sigma parameter is sigma_px/sqrt(2).
+        sigma = sigma_px / np.sqrt(2.0)
+        if sigma < 1e-8:
+            component = channel
+        else:
+            component = gaussian_filter(
+                channel, sigma=sigma, mode="reflect", truncate=4.0
+            )
+        result += weight * component
+    return result
+
+
+def scielab_map(reference_rgb, test_rgb,
+                samples_per_degree=DEFAULT_SAMPLES_PER_DEGREE):
+    """
+    Return pixelwise S-CIELAB DeltaE*ab map for matching RGB image pairs.
+
+    samples_per_degree must represent image sampling density in pixels per
+    degree of visual angle for the intended display/viewing condition.
+    """
+    ref = _as_srgb01(reference_rgb)
+    tst = _as_srgb01(test_rgb)
+    if ref.shape != tst.shape:
+        raise ValueError("Reference and test images must have identical dimensions.")
+    if not np.isfinite(samples_per_degree) or samples_per_degree <= 0:
+        raise ValueError("samples_per_degree must be a positive finite number.")
+
+    # Convert sRGB to linear CIE XYZ (D65, 2-degree observer).
+    ref_xyz = rgb2xyz(ref)
+    tst_xyz = rgb2xyz(tst)
+
+    # Linear XYZ -> opponent channels, filter each channel independently.
+    ref_opp = ref_xyz @ XYZ_TO_OPPONENT.T
+    tst_opp = tst_xyz @ XYZ_TO_OPPONENT.T
+    ref_filtered = np.empty_like(ref_opp)
+    tst_filtered = np.empty_like(tst_opp)
+
+    for channel, mixture in enumerate(FILTERS):
+        ref_filtered[..., channel] = _filter_opponent_channel(
+            ref_opp[..., channel], mixture, float(samples_per_degree)
+        )
+        tst_filtered[..., channel] = _filter_opponent_channel(
+            tst_opp[..., channel], mixture, float(samples_per_degree)
+        )
+
+    # Filtered opponent representation -> XYZ -> CIELAB (D65).
+    ref_filtered_xyz = ref_filtered @ OPPONENT_TO_XYZ.T
+    tst_filtered_xyz = tst_filtered @ OPPONENT_TO_XYZ.T
+    ref_lab = xyz2lab(ref_filtered_xyz, illuminant="D65", observer="2")
+    tst_lab = xyz2lab(tst_filtered_xyz, illuminant="D65", observer="2")
+
+    return deltaE_cie76(ref_lab, tst_lab).astype(np.float32)
+
+
+def scielab_mean_delta_e(reference_rgb, test_rgb,
+                         samples_per_degree=DEFAULT_SAMPLES_PER_DEGREE):
+    """Mean pixelwise S-CIELAB DeltaE*ab; lower values indicate less difference."""
+    difference = scielab_map(reference_rgb, test_rgb, samples_per_degree)
+    return float(np.mean(difference, dtype=np.float64))
+
+
 def metrics(gt, pred):
     from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-    from skimage.color import rgb2lab, deltaE_cie76, rgb2gray
+    from skimage.color import rgb2gray
     from scipy.ndimage import sobel
 
     psnr = float(peak_signal_noise_ratio(gt, pred, data_range=255))
     ssim = float(structural_similarity(gt, pred, channel_axis=2, data_range=255))
-    lab_gt = rgb2lab(gt.astype(np.float32) / 255.0)
-    lab_pred = rgb2lab(pred.astype(np.float32) / 255.0)
-    delta_e = float(np.mean(deltaE_cie76(lab_gt, lab_pred)))
+    # Zhang-Wandell pattern-colour separable S-CIELAB.
+    # samples/degree is configurable in scielab_metric_zhang_wandell.py.
+    delta_e = float(scielab_mean_delta_e(gt, pred))
     g = rgb2gray(gt.astype(np.float32) / 255.0)
     p = rgb2gray(pred.astype(np.float32) / 255.0)
     gx = np.hypot(sobel(g, axis=1), sobel(g, axis=0)).ravel()
@@ -199,7 +303,7 @@ def main():
     per_image_path = OUT / "E3E_vs_E5_1_per_image.csv"
     summary_path = OUT / "E3E_vs_E5_1_summary.csv"
     header = ["image", "PSNR_E3E", "PSNR_E5_1", "delta_PSNR", "SSIM_E3E", "SSIM_E5_1", "delta_SSIM",
-              "FSIM_E3E", "FSIM_E5_1", "delta_FSIM", "CIE76_DeltaE_E3E", "CIE76_DeltaE_E5_1", "delta_DeltaE",
+              "FSIM_E3E", "FSIM_E5_1", "delta_FSIM", "S_CIELAB_E3E", "S_CIELAB_E5_1", "delta_S_CIELAB",
               "EPI_E3E", "EPI_E5_1", "delta_EPI", "Edge_E3E", "Edge_E5_1", "delta_Edge",
               "MS_SSIM_E3E", "MS_SSIM_E5_1", "delta_MS_SSIM",
               "BRISQUE_E3E", "BRISQUE_E5_1", "delta_BRISQUE",
@@ -250,7 +354,7 @@ def main():
             write_csv(OUT / "skipped.csv", ["image", "reason"], skipped)
             print(f"Progress: {i}/{len(pairs)} | successful: {len(rows)} | skipped: {len(skipped)}", flush=True)
 
-    metric_names = ["PSNR", "SSIM", "FSIM", "CIE76_DeltaE", "EPI", "Edge_Retention",
+    metric_names = ["PSNR", "SSIM", "FSIM", "S_CIELAB", "EPI", "Edge_Retention",
                     "MS_SSIM", "BRISQUE", "NIQE", "PIQE"]
     idx = [(1,2), (4,5), (7,8), (10,11), (13,14), (16,17),
            (19,20), (22,23), (25,26), (28,29)]
